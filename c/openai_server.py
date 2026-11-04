@@ -199,6 +199,7 @@ class GenerationScheduler:
         # True while serve() starts a dead engine again (keep_engine): nothing is admitted,
         # so a request waits in the queue for the new engine instead of failing on the old
         self.paused = False
+        self.drain_lease = None
         self.admitted = 0
         self.completed = 0
         self.failed = 0
@@ -218,6 +219,9 @@ class GenerationScheduler:
             if self.closed:
                 raise APIError(503, "The inference scheduler is shutting down.", None,
                                "scheduler_closed", "server_error")
+            if self.drain_lease is not None:
+                raise APIError(503, "The inference scheduler is draining.", None,
+                               "scheduler_draining", "server_error")
             if (self.paused or self._available_slot(slot) is None) and len(self.queue) >= self.max_queue:
                 self.rejected += 1
                 raise APIError(429, "The inference queue is full.", None, "queue_full",
@@ -268,6 +272,33 @@ class GenerationScheduler:
                 self._observe("slot_duration_seconds", time.monotonic() - admitted_at)
                 self.condition.notify_all()
 
+    def begin_drain(self, lease):
+        with self.condition:
+            if self.closed or (self.drain_lease is not None and self.drain_lease != lease):
+                raise ValueError("scheduler cannot accept this drain lease")
+            self.drain_lease = lease
+            self.condition.notify_all()
+
+    def wait_drained(self, lease, timeout, stopping=None):
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while True:
+                if self.closed or self.drain_lease != lease or (stopping is not None and stopping.is_set()):
+                    raise ValueError("drain lease no longer owns admission")
+                if self.active == 0 and not self.queue:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.condition.wait(min(remaining, 0.1))
+
+    def resume_drain(self, lease):
+        with self.condition:
+            if self.closed or self.drain_lease != lease:
+                raise ValueError("drain lease no longer owns admission")
+            self.drain_lease = None
+            self.condition.notify_all()
+
     def pause(self):
         with self.condition:
             self.paused = True
@@ -291,7 +322,8 @@ class GenerationScheduler:
 
     def snapshot(self):
         with self.condition:
-            return {"active": self.active, "queued": len(self.queue),
+            return {"accepting": not self.closed and self.drain_lease is None,
+                    "active": self.active, "queued": len(self.queue),
                     "capacity": self.capacity,
                     "max_queue": self.max_queue, "queue_timeout_seconds": self.queue_timeout,
                     "admitted": self.admitted, "completed": self.completed, "failed": self.failed,
@@ -6869,6 +6901,7 @@ class Engine:
         self.write_lock = threading.Lock()
         self.pending_lock = threading.Lock()
         self.pending = {}
+        self.unconfirmed = set()  # protocol writes without a terminal engine acknowledgement
         self.next_request_id = 1
         self.closed = False
         self.dispatcher_error = None
@@ -6982,6 +7015,7 @@ class Engine:
         except Exception as error:
             with self.pending_lock:
                 self.pending.pop(request_id, None)
+                self.unconfirmed.add(request_id)
             if isinstance(error, OSError):
                 raise RuntimeError(f"failed to write {frame} to the engine ({error})") from error
             raise
@@ -7205,6 +7239,7 @@ class Engine:
                     with self.live_lock:
                         self.live.pop(request_id, None)
                     with self.pending_lock:
+                        self.unconfirmed.discard(request_id)
                         entry = self.pending.pop(request_id, None)
                     if entry is not None:
                         # The turn is over, so a fault recorded mid-turn is delivered now
@@ -7257,6 +7292,7 @@ class Engine:
                     with self.live_lock:
                         self.live.pop(request_id, None)
                     with self.pending_lock:
+                        self.unconfirmed.discard(request_id)
                         entry = self.pending.pop(request_id, None)
                     if entry is not None:
                         reported = _engine_error(fields[2:], message)
@@ -7351,6 +7387,7 @@ class Engine:
         except Exception:
             with self.pending_lock:
                 self.pending.pop(request_id, None)
+                self.unconfirmed.add(request_id)
             raise
         decision = None
         while True:
@@ -7486,6 +7523,7 @@ class Engine:
         except Exception:
             with self.pending_lock:
                 self.pending.pop(request_id, None)
+                self.unconfirmed.add(request_id)
             raise
 
         cancel_sent = False
@@ -10271,7 +10309,7 @@ def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RES
 
 def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
           cap=None, max_tokens=1024, engine=None, env=None, cors_origins=None,
-          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None):
+          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None, owner_control_dir=None):
     if not 0 <= max_tokens:
         raise ValueError("max_tokens cannot be negative (0: the context the engine holds)")
     if not 1 <= port <= 65535:
@@ -10304,6 +10342,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
                        max_queue, queue_timeout, kv_slots, allowed_hosts=allowed_hosts)
     runtime = None
+    owner_control = None
     stopping = threading.Event()
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
@@ -10365,6 +10404,27 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                   + (" (the engine loaded no vision tower; a picture gets a 400)"
                      if family.capabilities.image and runtime.vision is False else ""),
                   file=sys.stderr)
+        if owner_control_dir is not None:
+            from owner_control import OwnerControl
+            def owner_identity():
+                if not server.engine_swap.acquire(blocking=False):
+                    return {"known": False}
+                try:
+                    current = server.engine
+                    process = getattr(current, "process", None)
+                    if process is None or not hasattr(current, "pending_lock") or not current.pending_lock.acquire(blocking=False):
+                        return {"known": False}
+                    try:
+                        return {"known": process.poll() is None and not current.closed
+                                        and getattr(current, "dispatcher_error", None) is None
+                                        and not current.unconfirmed,
+                                "pid": process.pid, "generation": server.engine_restarts,
+                                "pending": len(current.pending)}
+                    finally:
+                        current.pending_lock.release()
+                finally:
+                    server.engine_swap.release()
+            owner_control = OwnerControl(owner_control_dir, server.scheduler, owner_identity)
         server.keeps_engine = True
         watchdog = threading.Thread(target=keep_engine, args=(server, start_engine, stopping),
                                     name="colibri-engine-watchdog", daemon=True)
@@ -10390,6 +10450,8 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
             stopping.set()
         signal.signal(signal.SIGTERM, previous_sigterm)
         server.scheduler.close()
+        if owner_control is not None:
+            owner_control.close()
         server.server_close()
         # the engine running now: keep_engine may have replaced the first one
         for running in {id(e): e for e in (server.engine, runtime) if e is not None}.values():
@@ -10402,6 +10464,7 @@ def main():
     parser.add_argument("--engine")
     parser.add_argument("--arch", choices=("auto", *family_ids()), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
+    parser.add_argument("--owner-control-dir", help="private process-owned directory for optional Linux drain control")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID"))
@@ -10442,7 +10505,7 @@ def main():
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
-          allowed_hosts=args.allowed_host,family=family)
+          allowed_hosts=args.allowed_host,family=family,owner_control_dir=args.owner_control_dir)
 
 
 if __name__ == "__main__":
